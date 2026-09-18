@@ -1,0 +1,602 @@
+#!/system/bin/sh
+# MagicDNS conditional forwarder (SmartDNS) control script.
+# Usage: tailscaled.dns {start|stop|restart|status}
+#
+# How it works:
+#   * A local SmartDNS instance listens on 127.0.0.1:$TS_DNS_PORT and
+#     [::1]:$TS_DNS_PORT (UDP+TCP). It runs as ROOT: privilege dropping to
+#     AID_NOBODY is impossible on Android -- (a) "user nobody" fails because
+#     this build is musl whose getpwnam_r only reads /etc/passwd (absent on
+#     AOSP), and (b) setuidgid to 9999 then exec'ing /data/adb binaries is
+#     blocked by SELinux ("can't execute 'busybox': Permission denied").
+#   * Loop protection therefore uses a destination allow-list instead of a
+#     fwmark: SO_MARK (server -set-mark) silently fails under the boot
+#     SELinux domain (setsockopt returns -1, SmartDNS ignores the error,
+#     mark=0) -- the forwarder's own queries then matched the old
+#     "-m mark ! --mark" rules and were DNAT'ed back to itself: an endless
+#     self-hijack loop that killed ALL resolution. Proven on-device:
+#     boot-domain smartdns mark counters stayed 0 while su-domain counters
+#     ticked 6 and resolved. So mdns14 rules are:
+#       - every upstream line in smartdns.conf is also emitted into the
+#         iptables allow-list ($UPSTREAM_ALL, same source -> no loop);
+#       - iptables: for each upstream, "RETURN" (allow) first, then
+#         "DNAT --to-destination 127.0.0.1:15353" for everything else.
+#         smartdns's queries to its own upstreams are never looped back;
+#         netd/app queries to ANY other DNS server are hijacked.
+#         No fwmark, no uid match, no drop of privileges -- immune to the
+#         SELinux domain difference.
+#   * MagicDNS names (*.ts.net and custom tailnet names) are answered
+#     DIRECTLY from live "tailscale status --json" data:
+#       domain-rules /<node>.ts.net/ -address 100.x.x.x
+#     This does not depend on tailscaled's own DNS server (100.100.100.100),
+#     which cannot start on Android for this build (no netd integration).
+#   * Everything else is forwarded to FIXED public DNS (223.5.5.5 /
+#     119.29.29.29, or TS_DNS_UPSTREAM if configured). The system DNS is
+#     deliberately NOT used as an upstream (mdns16): if the allow-list
+#     were the system DNS, netd's own queries would bypass the forwarder
+#     and *.ts.net would fail for every app while the health probe still
+#     looked healthy (P0). It is read only to warn on overlap.
+#   * tailscaled's own DNS takeover is disabled ("tailscale set
+#     --accept-dns=false", retried every watchdog cycle): its iptables DNAT
+#     to 100.100.100.100:53 is a dead rule on Android (nothing listens) and
+#     would break ALL resolution.
+#   * A watchdog (tailscaled.dns watchdog) runs every 60s:
+#       - keeps --accept-dns=false and scrubs tailscaled's dead DNAT rule;
+#       - watches the phone's IPv4 addresses: on ANY change it restarts the
+#         forwarder immediately. Rationale: smartdns connect()s upstreams with
+#         a fixed source address at start; Android DHCP drifts the phone's IP,
+#         the socket's source goes stale and upstream replies never arrive.
+#         Restarting on IP change (not on failure) prevents the outage.
+#       - runs a REAL end-to-end probe (nslookup www.baidu.com -> hijack ->
+#         smartdns -> upstream; www.baidu.com is -no-cache so no stale cache
+#         answer can fake a healthy forwarder). 2 consecutive failures ->
+#         restart (never probed in the same cycle: a fresh smartdns needs
+#         warm-up); 3 -> drop rules (system DNS restored, degraded mode),
+#         retry every 5 minutes;
+#       - also probes the REAL system path (first detect_upstream DNS +
+#         a MagicDNS direct-answer name): if the system DNS is allow-listed
+#         (P0), that query RETURNs past smartdns and the probe logs
+#         "P0 HIT" (visibility only; restart cannot fix an allow-list
+#         conflict);
+#       - if smartdns died: count, restart, degraded at 3rd consecutive miss;
+#       - if the explicit upstream config changed, regenerate config + restart;
+#       - if the MagicDNS node table changed, regenerate address rules.
+DIR=$(dirname "$(realpath "$0")")
+# shellcheck source=../settings.sh
+. "$DIR"/../settings.sh
+
+DNS_ENABLE="${TS_DNS_ENABLE:-1}"
+DNS_PORT="${TS_DNS_PORT:-15353}"
+MAGIC_SERVER="${TS_MAGICDNS_SERVER:-100.100.100.100}"
+DOMAINS="${TS_MAGICDNS_DOMAINS:-ts.net}"
+UPSTREAM_CFG="${TS_DNS_UPSTREAM:-}"
+# allow-list of the forwarder's own upstreams, generated in gen_conf() from
+# the SAME source as smartdns.conf (identical loop-back guarantee), split by
+# family because v4/v6 iptables cannot match each other's addresses
+UPSTREAM_ALL_V4=""
+UPSTREAM_ALL_V6=""
+
+SMARTDNS_BIN="${TS_DIR}/bin/smartdns"
+SMARTDNS_LIB="$TS_DIR/lib"
+SMARTDNS_CONF="$TS_RUN_DIR/smartdns.conf"
+SMARTDNS_LOG="$TS_RUN_DIR/smartdns.log"
+SMARTDNS_PID="$TS_RUN_DIR/smartdns.pid"
+WATCHDOG_PID="$TS_RUN_DIR/smartdns.watchdog.pid"
+UPSTREAM_STATE="$TS_RUN_DIR/smartdns.upstream"
+MAGIC_STATE="$TS_RUN_DIR/smartdns.magic"
+IP_STATE="$TS_RUN_DIR/smartdns.ip"
+TS_BIN="${TS_DIR}/bin/tailscale"
+TS_JQ="${TS_DIR}/bin/jq"
+IPTABLES="iptables"
+IP6TABLES="ip6tables"
+COMMENT="tailscale-magicdns"
+
+detect_upstream() {
+  # returns space-separated, normalized DNS servers detected from the system.
+  # getprop values may be comma/space separated lists and IPv6 scopes may
+  # carry a %zone suffix -- both would silently break the smartdns.conf
+  # "server" line AND the iptables -d allow-list, so normalize here.
+  local list="" v p d
+  for p in net.dns1 net.dns2 dhcp.wlan0.dns1 dhcp.wlan0.dns2 dhcp.eth0.dns1 dhcp.eth0.dns2; do
+    v=$(getprop "$p" 2>/dev/null)
+    [ -n "$v" ] || continue
+    v=${v//,/ }
+    for d in $v; do
+      case "$d" in
+        "" | 0.0.0.0 | :: ) ;;
+        *%*) list="$list ${d%%%*}" ;;
+        *) list="$list $d" ;;
+      esac
+    done
+  done
+  echo "$list"
+}
+
+# The upstream servers SmartDNS itself will query (same source as gen_conf).
+# mdns16: FIXED public DNS unless the user explicitly overrides. The system
+# DNS is deliberately NOT used as an upstream: if the allow-list were the
+# system DNS, netd's own queries would hit RETURN and bypass smartdns ->
+# *.ts.net NXDOMAIN for every app while the 127.0.0.1 health probe still
+# reports healthy (P0). The system DNS is still read, but only to WARN when
+# it overlaps the allow-list (see gen_conf).
+upstream_list() {
+  if [ -n "$UPSTREAM_CFG" ]; then
+    echo "$UPSTREAM_CFG"
+  else
+    echo "223.5.5.5 119.29.29.29"
+  fi
+}
+
+# MagicDNS address rules from live tailscale status (no 100.100.100.100).
+gen_magic_addresses() {
+  local out
+  out=$("$TS_BIN" status --json 2>/dev/null | "$TS_JQ" -r '
+    [.Self, .Peer[]?] | .[] |
+    select(.DNSName != null and .DNSName != "") |
+    ((.TailscaleIPs[]? | select(test("^100\\."))) // .TailscaleIPs[0] // empty) as $ip |
+    .DNSName | rtrimstr(".") as $d |
+    "domain-rules /\($d)/ -address \($ip)"
+  ' 2>/dev/null) || out=""
+  [ -n "$out" ] && echo "$out" || true
+}
+
+gen_conf() {
+  local ups="" s
+  UPSTREAM_ALL_V4=""
+  UPSTREAM_ALL_V6=""
+  local sys d
+  if [ -n "$UPSTREAM_CFG" ]; then
+    for s in $UPSTREAM_CFG; do
+      case "$s" in
+        127.* | ::1) log Warning "skipping loopback upstream $s (would self-hijack)"; continue ;;
+        *:*) ups="$ups\nserver $s"; UPSTREAM_ALL_V6="$UPSTREAM_ALL_V6 $s" ;;
+        *) ups="$ups\nserver $s"; UPSTREAM_ALL_V4="$UPSTREAM_ALL_V4 $s" ;;
+      esac
+    done
+  else
+    # mdns16: upstream is FIXED public DNS. Never adopt the system DNS as an
+    # upstream -- the allow-list is then exactly what netd queries (P0):
+    # netd hits RETURN, ts.net goes unanswered, while the 127.0.0.1 probe
+    # still looks healthy.
+    ups="\nserver 223.5.5.5\nserver 119.29.29.29"
+    UPSTREAM_ALL_V4=" 223.5.5.5 119.29.29.29"
+  fi
+  # P0 window: warn if a system DNS the netd would query is itself
+  # allow-listed (then netd queries bypass the forwarder entirely).
+  for sys in $(detect_upstream); do
+    for d in $UPSTREAM_ALL_V4 $UPSTREAM_ALL_V6; do
+      [ "$sys" = "$d" ] && log Warning "system DNS $sys is allow-listed (P0 window): netd queries would bypass MagicDNS"
+    done
+  done
+  if [ -z "$ups" ]; then
+    ups="\nserver 223.5.5.5\nserver 119.29.29.29"
+    UPSTREAM_ALL_V4=" 223.5.5.5 119.29.29.29"
+    [ -n "$UPSTREAM_CFG" ] && log Warning "configured upstreams were all skipped, using public DNS 223.5.5.5/119.29.29.29"
+  fi
+  {
+    echo "bind 127.0.0.1:${DNS_PORT}"
+    echo "bind [::1]:${DNS_PORT}"
+    echo "bind-tcp 127.0.0.1:${DNS_PORT}"
+    echo "bind-tcp [::1]:${DNS_PORT}"
+    echo "cache-size 512"
+    echo "cache-persist no"
+    echo "log-level info"
+    echo "log-file ${SMARTDNS_LOG}"
+    echo "log-console no"
+    echo "log-size 256K"
+    printf "%b\n" "$ups"
+    # probe domain for watchdog health_check: never cached, so every probe
+    # really hits the upstream path (a cached answer would hide a broken
+    # forwarder and make the watchdog a no-op)
+    echo "domain-rules /www.baidu.com/ -no-cache"
+    gen_magic_addresses
+  } > "$SMARTDNS_CONF"
+}
+
+# NOTE on -set-mark: deliberately NOT used (mdns13 -> mdns14 change).
+# SmartDNS's "server ... -set-mark" does setsockopt(SO_MARK); under the boot
+# SELinux domain that call silently fails, SmartDNS ignores the return value,
+# the mark stays 0, and the old "-m mark !" rules then hijacked the
+# forwarder's OWN queries back to itself (endless loop, ALL DNS dead).
+# Destination allow-list (RETURN for upstreams, DNAT for the rest) is immune.
+
+ipt_add_rules() {
+  # allow-list the forwarder's own upstreams first (RETURN), then hijack
+  # everything else: smartdns's queries to its upstreams are never looped
+  # back, no fwmark needed (immune to the boot-domain SO_MARK failure)
+  # NEVER install the DNAT without a non-empty allow-list: with an empty
+  # list smartdns's own upstream queries would be hijacked back to itself
+  # (mdns14 P1: the start() "already running" path used to hit exactly this)
+  if [ -z "$UPSTREAM_ALL_V4" ]; then
+    log Error "iptables: empty v4 upstream allow-list, refusing DNAT (would self-hijack)"
+    return 1
+  fi
+  local d
+  for d in $UPSTREAM_ALL_V4; do
+    $IPTABLES -t nat -C OUTPUT -p udp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null || \
+      $IPTABLES -t nat -A OUTPUT -p udp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null
+    $IPTABLES -t nat -C OUTPUT -p tcp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null || \
+      $IPTABLES -t nat -A OUTPUT -p tcp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null
+  done
+  $IPTABLES -t nat -C OUTPUT -p udp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination 127.0.0.1:${DNS_PORT} 2>/dev/null || \
+    $IPTABLES -t nat -A OUTPUT -p udp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination 127.0.0.1:${DNS_PORT} 2>/dev/null
+  $IPTABLES -t nat -C OUTPUT -p tcp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination 127.0.0.1:${DNS_PORT} 2>/dev/null || \
+    $IPTABLES -t nat -A OUTPUT -p tcp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination 127.0.0.1:${DNS_PORT} 2>/dev/null
+}
+
+ipt_del_rules() {
+  # remove every rule we own by COMMENT via -S + repeated first-match delete:
+  # rule shapes change whenever upstreams change, and -D by line number can
+  # race with concurrent rule updates -- deleting the first match repeatedly
+  # is order-independent. Also scrub tailscaled's own (dead) DNS hijack.
+  $IPTABLES -t nat -D OUTPUT -p udp --dport 53 ! -d ${MAGIC_SERVER} ! -o tun+ -j DNAT --to-destination ${MAGIC_SERVER}:53 2>/dev/null || true
+  $IPTABLES -t nat -D OUTPUT -p tcp --dport 53 ! -d ${MAGIC_SERVER} ! -o tun+ -j DNAT --to-destination ${MAGIC_SERVER}:53 2>/dev/null || true
+  local rule i=0
+  while [ "$i" -lt 20 ]; do
+    rule=$($IPTABLES -t nat -S OUTPUT 2>/dev/null | awk -v c="$COMMENT" 'index($0,c){print $0; exit}')
+    [ -n "$rule" ] || break
+    $IPTABLES -t nat -D OUTPUT ${rule#*-A OUTPUT } 2>/dev/null || true
+    i=$((i+1))
+  done
+}
+
+ip6t_add_rules() {
+  command -v "$IP6TABLES" >/dev/null 2>&1 || { log Warning "ip6tables not found, IPv6 DNS queries bypass the forwarder"; return 0; }
+  # some kernels ship without the IPv6 nat table (CONFIG_IP6_NF_TARGET_DNAT
+  # trimmed, e.g. xiaomi-14); detect it once so we log a warning instead of
+  # a misleading error. v4 DNS hijack is unaffected.
+  if ! $IP6TABLES -t nat -L -n >/dev/null 2>&1; then
+    log Warning "IPv6 nat table unavailable on this kernel, IPv6 DNS queries bypass the forwarder"
+    return 0
+  fi
+  local d
+  for d in $UPSTREAM_ALL_V6; do
+    $IP6TABLES -t nat -C OUTPUT -p udp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null || \
+      $IP6TABLES -t nat -A OUTPUT -p udp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null
+    $IP6TABLES -t nat -C OUTPUT -p tcp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null || \
+      $IP6TABLES -t nat -A OUTPUT -p tcp --dport 53 -d "$d" -m comment --comment "$COMMENT" -j RETURN 2>/dev/null
+  done
+  $IP6TABLES -t nat -C OUTPUT -p udp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination [::1]:${DNS_PORT} 2>/dev/null || \
+    $IP6TABLES -t nat -A OUTPUT -p udp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination [::1]:${DNS_PORT} 2>/dev/null
+  $IP6TABLES -t nat -C OUTPUT -p tcp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination [::1]:${DNS_PORT} 2>/dev/null || \
+    $IP6TABLES -t nat -A OUTPUT -p tcp --dport 53 -m comment --comment "$COMMENT" -j DNAT --to-destination [::1]:${DNS_PORT} 2>/dev/null
+}
+
+ip6t_del_rules() {
+  command -v "$IP6TABLES" >/dev/null 2>&1 || return 0
+  $IP6TABLES -t nat -L -n >/dev/null 2>&1 || return 0
+  local rule i=0
+  while [ "$i" -lt 20 ]; do
+    rule=$($IP6TABLES -t nat -S OUTPUT 2>/dev/null | awk -v c="$COMMENT" 'index($0,c){print $0; exit}')
+    [ -n "$rule" ] || break
+    $IP6TABLES -t nat -D OUTPUT ${rule#*-A OUTPUT } 2>/dev/null || true
+    i=$((i+1))
+  done
+}
+
+is_running() {
+  # pid-file + kill(0) + /proc cmdline triple check: the pid file may hold a
+  # recycled pid after reboot (a random process would then "look" running).
+  # The binary is exec'd through libc.so so the process NAME is "libc.so",
+  # but argv[0] still contains the "smartdns" argument -- that is what we grep.
+  [ -f "$SMARTDNS_PID" ] || return 1
+  local p
+  p=$(cat "$SMARTDNS_PID" 2>/dev/null)
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  grep -q "smartdns" "/proc/$p/cmdline" 2>/dev/null
+}
+
+is_watchdog_running() {
+  # same triple check for the watchdog (also exec'd as a sh script, so the
+  # process name is "sh" and only cmdline identifies it reliably)
+  [ -f "$WATCHDOG_PID" ] || return 1
+  local p
+  p=$(cat "$WATCHDOG_PID" 2>/dev/null)
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null || return 1
+  grep -q "tailscaled.dns" "/proc/$p/cmdline" 2>/dev/null
+}
+
+health_check() {
+  # Real end-to-end probe: nslookup to 127.0.0.1:53 -> iptables DNAT ->
+  # smartdns -> upstream. The probe domain is excluded from smartdns's cache
+  # (see "domain-rules /www.baidu.com/ -no-cache" in gen_conf) so a stale
+  # cached answer can never produce a false positive.
+  local bb
+  bb=$(command -v busybox 2>/dev/null) || bb="/data/adb/magisk/busybox"
+  # P2-a: verify the REAL system path is hijacked, not just the 127.0.0.1
+  # entry. Probe the first detected system DNS (getprop net.dns* -- the same
+  # source the project uses to identify the system DNS) with a MagicDNS
+  # direct-answer domain: if the system DNS is allow-listed (P0), that query
+  # RETURNs past smartdns, the carrier/router DNS answers NXDOMAIN, and this
+  # probe fails while the probe below still reports healthy -- exactly the
+  # silent MagicDNS failure mdns15 left. (/etc/resolv.conf is unreliable on
+  # Android: often empty -> probe skipped, or 127.0.0.1 -> loopback DNAT ->
+  # false healthy, mdns16.1 B2.)
+  # This probe only LOGS: restart cannot fix an allow-list conflict and
+  # degrading would only make ts.net worse. Visibility, not action.
+  local sysdns probe
+  sysdns=$(detect_upstream | awk '{print $1}')
+  probe=$(awk '/^domain-rules \/.* -address /{print $2; exit}' "$SMARTDNS_CONF" 2>/dev/null | sed 's|^/||; s|/$||')
+  if [ -n "$sysdns" ] && [ -n "$probe" ]; then
+    # "Name:" is printed only when the answer carries records; NXDOMAIN has
+    # no Name: line. Matches v4 (100.x) AND v6 (fd7a:) answers, so a v6-only
+    # peer can never cause a false P0 alarm (mdns16.1 B5).
+    if ! timeout 5 "$bb" nslookup "$probe" "$sysdns" 2>/dev/null | grep -q "Name:"; then
+      log Error "P0 HIT: system DNS $sysdns is not hijacked (probe $probe via real path failed) - MagicDNS bypassed for normal apps"
+    fi
+  fi
+  timeout 5 "$bb" nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1
+}
+
+start_watchdog() {
+  # idempotent: never stack a second watchdog
+  if is_watchdog_running; then
+    return 0
+  fi
+  nohup "$DIR/tailscaled.dns" watchdog >> "$TS_RUN_LOG_FILE" 2>&1 &
+  echo $! > "$WATCHDOG_PID"
+  log Info "watchdog started (pid $(cat "$WATCHDOG_PID"))."
+}
+
+restart_forwarder() {
+  # kill smartdns and WAIT for it to actually exit before restarting:
+  # "Address in use" on 15353 has bitten us when a stale process survived
+  # the kill and the new instance failed to bind.
+  if is_running; then
+    local p i
+    p=$(cat "$SMARTDNS_PID" 2>/dev/null)
+    kill "$p" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 10 ] && kill -0 "$p" 2>/dev/null; do
+      sleep 0.5
+      i=$((i+1))
+    done
+    kill -9 "$p" 2>/dev/null || true
+  fi
+  pkill -f "smartdns -c ${SMARTDNS_CONF}" 2>/dev/null || true
+  rm -f "$SMARTDNS_PID"
+  start 2>/dev/null || log Error "restart with new settings failed"
+}
+
+start() {
+  if [ "$DNS_ENABLE" != "1" ]; then
+    log Info "MagicDNS forwarder is disabled in settings.sh (TS_DNS_ENABLE=0)."
+    return 0
+  fi
+  # tailscaled must not hijack DNS itself: its DNS server cannot start on
+  # Android, so its DNAT rule points at a dead port and breaks everything.
+  "$TS_BIN" set --accept-dns=false 2>/dev/null || true
+  if is_running; then
+    log Info "MagicDNS forwarder already running (pid $(cat "$SMARTDNS_PID"))."
+    # mdns15 (P1): gen_conf MUST run here too -- UPSTREAM_ALL_V4/V6 are
+    # produced inside it, and ipt_add_rules with an empty allow-list installs
+    # only the DNAT, self-hijacking the running smartdns (mdns14 shipped with
+    # exactly this bug on the "already running" path).
+    gen_conf
+    ipt_del_rules 2>/dev/null || true
+    ip6t_del_rules 2>/dev/null || true
+    ipt_add_rules || log Error "iptables DNAT rules failed"
+    ip6t_add_rules || log Error "ip6tables DNAT rules failed"
+    start_watchdog
+    return 0
+  fi
+  [ -f "$SMARTDNS_BIN" ] || { log Error "smartdns not found: $SMARTDNS_BIN"; return 1; }
+  [ -f "$SMARTDNS_LIB/libc.so" ] || { log Error "smartdns runtime lib not found: $SMARTDNS_LIB/libc.so"; return 1; }
+  # libc.so doubles as the musl dynamic loader and must be executable
+  [ -x "$SMARTDNS_LIB/libc.so" ] || chmod 0755 "$SMARTDNS_LIB/libc.so" 2>/dev/null || true
+
+  mkdir -p "$TS_RUN_DIR"
+  gen_conf
+  rm -f "$SMARTDNS_LOG"
+  # smartdns runs as ROOT (see header: dropping privileges is blocked by
+  # SELinux on Android). Loop protection is by destination allow-list
+  # (RETURN for upstreams, DNAT for the rest), not by fwmark/uid. LD_LIBRARY_PATH
+  # is set with shell builtins inside a subshell so no dynamically-linked
+  # helper (env/busybox) is ever exposed to the override -- mdns5 broke exactly there.
+  ( LD_LIBRARY_PATH="$SMARTDNS_LIB"; export LD_LIBRARY_PATH; exec "$SMARTDNS_LIB/libc.so" "$SMARTDNS_BIN" -c "$SMARTDNS_CONF" -f ) >> "$TS_RUN_LOG_FILE" 2>&1 &
+  echo $! > "$SMARTDNS_PID"
+  sleep 1
+  if ! is_running; then
+    log Error "MagicDNS forwarder failed to start, see $TS_RUN_LOG_FILE"
+    rm -f "$SMARTDNS_PID"
+    return 1
+  fi
+  ipt_del_rules 2>/dev/null || true
+  ip6t_del_rules 2>/dev/null || true
+  ipt_add_rules || log Error "iptables DNAT rules failed"
+  ip6t_add_rules || log Error "ip6tables DNAT rules failed"
+  start_watchdog
+  log Info "MagicDNS forwarder started on 127.0.0.1/[::1]:${DNS_PORT} with destination allow-list loop-protection (pid $(cat "$SMARTDNS_PID"))."
+  # NOTE: no self-check here on purpose -- a freshly started smartdns needs a
+  # moment to finish upstream setup, and an immediate probe (mdns12) caused
+  # false "unhealthy" verdicts that raced the watchdog into degraded mode.
+  # The watchdog owns health verification on its own 60s cadence.
+}
+
+stop() {
+  # kill watchdog first so it cannot resurrect smartdns
+  if is_watchdog_running; then
+    kill "$(cat "$WATCHDOG_PID" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$WATCHDOG_PID"
+  else
+    rm -f "$WATCHDOG_PID" 2>/dev/null || true
+  fi
+  ipt_del_rules 2>/dev/null || true
+  ip6t_del_rules 2>/dev/null || true
+  if is_running; then
+    local p i
+    p=$(cat "$SMARTDNS_PID" 2>/dev/null)
+    kill "$p" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 10 ] && kill -0 "$p" 2>/dev/null; do
+      sleep 0.5
+      i=$((i+1))
+    done
+    kill -9 "$p" 2>/dev/null || true
+  fi
+  pkill -f "smartdns -c ${SMARTDNS_CONF}" 2>/dev/null || true
+  rm -f "$SMARTDNS_PID"
+  log Info "MagicDNS forwarder stopped, iptables/ip6tables rules removed."
+}
+
+status() {
+  if is_running; then
+    log Info "MagicDNS forwarder: RUNNING (pid $(cat "$SMARTDNS_PID")), listen 127.0.0.1/[::1]:${DNS_PORT}"
+  else
+    log Info "MagicDNS forwarder: NOT running"
+  fi
+  if is_watchdog_running; then
+    log Info "watchdog: RUNNING (pid $(cat "$WATCHDOG_PID"))"
+  else
+    log Info "watchdog: NOT running"
+  fi
+  $IPTABLES -t nat -L OUTPUT -n 2>/dev/null | grep -q "$COMMENT" && \
+    log Info "iptables DNAT rules: present" || log Info "iptables DNAT rules: absent"
+  if command -v "$IP6TABLES" >/dev/null 2>&1 && $IP6TABLES -t nat -L -n >/dev/null 2>&1; then
+    log Info "IPv6 DNAT: supported"
+  else
+    log Info "IPv6 DNAT: unavailable on this kernel, v6 DNS queries bypass"
+  fi
+  log Info "Upstream: $(upstream_list | sed 's/^ //')"
+  log Info "MagicDNS entries: $(gen_magic_addresses 2>/dev/null | grep -c 'domain-rules' || true)"
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  watchdog)
+    # standalone monitor loop (spawned by start_watchdog), 60s period.
+    # Failure model (mdns13):
+    #   IP address changed (DHCP drift on Android is the root cause of the
+    #     "forwarder works right after restart, dies minutes later" bug:
+    #     smartdns connect()s upstreams with a fixed source address at start,
+    #     and once the phone's IP moves that socket's source is gone ->
+    #     replies never come back. SmartDNS's own 5s socket-rebuild path never
+    #     fires because queries already timed out at ~2.4s)
+    #     -> restart_forwarder immediately (new process connects the new IP)
+    #   process down -> count, restart at 3rd consecutive miss
+    #   process up but probe fails -> count, restart at 2nd miss, degraded at
+    #     3rd; after a restart we NEVER probe in the same cycle (the fresh
+    #     smartdns needs warm-up; probing too early caused false deaths and
+    #     raced us into degraded mode in mdns12)
+    #   degraded mode -> rules dropped (system DNS restored), retry every 5min
+    echo "$(upstream_list)" > "$UPSTREAM_STATE"
+    gen_magic_addresses > "$MAGIC_STATE"
+    ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | tr '\n' ' ' > "$IP_STATE"
+    FAIL_CNT=0
+    DEGRADED=0
+    while :; do
+      if [ "$DEGRADED" = "1" ]; then
+        sleep 300
+        # someone (manual start / another watchdog cycle) may have restored
+        # the forwarder while we slept -- never fight a working setup
+        if is_running; then
+          FAIL_CNT=0
+          DEGRADED=0
+          log Info "watchdog: forwarder found running again, leaving degraded mode"
+          continue
+        fi
+        log Info "watchdog: degraded retry (attempting to restore forwarder)"
+        restart_forwarder 2>/dev/null
+        # allow the fresh process to finish upstream setup before judging
+        sleep 5
+        if health_check; then
+          FAIL_CNT=0
+          DEGRADED=0
+          log Info "watchdog: forwarder restored, back to normal mode"
+        else
+          ipt_del_rules 2>/dev/null || true
+          ip6t_del_rules 2>/dev/null || true
+          pkill -f "smartdns -c ${SMARTDNS_CONF}" 2>/dev/null || true
+          rm -f "$SMARTDNS_PID"
+          log Error "watchdog: degraded retry failed, DNS stays on system"
+        fi
+        continue
+      fi
+      sleep 60
+      # 0) keep tailscaled from (re-)adding its dead DNS hijack. On boot the
+      #    tailscaled daemon may not be ready when start() ran, so retry here
+      #    every cycle (idempotent, no side effects) and scrub the dead rule.
+      "$TS_BIN" set --accept-dns=false 2>/dev/null || true
+      $IPTABLES -t nat -D OUTPUT -p udp --dport 53 ! -d ${MAGIC_SERVER} ! -o tun+ -j DNAT --to-destination ${MAGIC_SERVER}:53 2>/dev/null || true
+      $IPTABLES -t nat -D OUTPUT -p tcp --dport 53 ! -d ${MAGIC_SERVER} ! -o tun+ -j DNAT --to-destination ${MAGIC_SERVER}:53 2>/dev/null || true
+      # 0.5) IP changed -> restart now (root-cause prevention for stale
+      #      connect() source addresses); never probe in the same cycle
+      cur_ip="$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | tr '\n' ' ')"
+      old_ip="$(cat "$IP_STATE" 2>/dev/null)"
+      if [ "$cur_ip" != "$old_ip" ]; then
+        echo "$cur_ip" > "$IP_STATE"
+        log Info "watchdog: IP changed ($old_ip -> $cur_ip), restarting forwarder"
+        restart_forwarder 2>/dev/null
+        continue
+      fi
+      # 1) process down -> count, bounded retries, then fail-safe
+      if ! is_running; then
+        FAIL_CNT=$((FAIL_CNT+1))
+        log Warning "watchdog: smartdns not running (attempt $FAIL_CNT/3)"
+        if [ "$FAIL_CNT" -ge 3 ]; then
+          log Error "watchdog: smartdns repeatedly down, entering degraded mode (system DNS restored)"
+          ipt_del_rules 2>/dev/null || true
+          ip6t_del_rules 2>/dev/null || true
+          DEGRADED=1
+        else
+          start 2>/dev/null || log Error "watchdog: restart attempt failed"
+        fi
+        continue
+      fi
+      # 2) process up but forwarding broken -> health-check driven restart
+      if ! health_check; then
+        FAIL_CNT=$((FAIL_CNT+1))
+        log Warning "watchdog: forwarder unhealthy (attempt $FAIL_CNT/3)"
+        if [ "$FAIL_CNT" -ge 3 ]; then
+          # restart already happened at 2/3 and the next cycle still failed:
+          # the forwarder is genuinely stuck, fail safe instead of churning
+          log Error "watchdog: forwarder unhealthy, entering degraded mode (system DNS restored)"
+          ipt_del_rules 2>/dev/null || true
+          ip6t_del_rules 2>/dev/null || true
+          pkill -f "smartdns -c ${SMARTDNS_CONF}" 2>/dev/null || true
+          rm -f "$SMARTDNS_PID"
+          DEGRADED=1
+          continue
+        fi
+        if [ "$FAIL_CNT" -ge 2 ]; then
+          restart_forwarder 2>/dev/null
+          # do NOT probe here -- the new instance needs warm-up; next cycle
+          # will judge it. a false "still unhealthy" verdict right after a
+          # restart is what raced mdns12 into degraded mode.
+          log Info "watchdog: forwarder restarted, will verify next cycle"
+        fi
+        continue
+      fi
+      FAIL_CNT=0
+      changed=""
+      # 3) upstream changed (wifi<->cellular / VPN) -> regenerate config
+      cur="$(upstream_list)"
+      old="$(cat "$UPSTREAM_STATE" 2>/dev/null)"
+      if [ "$cur" != "$old" ]; then
+        echo "$cur" > "$UPSTREAM_STATE"
+        log Info "watchdog: upstream changed ($old -> $cur)"
+        changed=1
+      fi
+      # 4) MagicDNS node table changed -> regenerate address rules
+      cur_addr="$(gen_magic_addresses)"
+      old_addr="$(cat "$MAGIC_STATE" 2>/dev/null)"
+      if [ "$cur_addr" != "$old_addr" ]; then
+        echo "$cur_addr" > "$MAGIC_STATE"
+        log Info "watchdog: MagicDNS entries changed"
+        changed=1
+      fi
+      if [ -n "$changed" ]; then
+        restart_forwarder 2>/dev/null
+      fi
+    done
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac

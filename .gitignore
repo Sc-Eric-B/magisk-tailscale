@@ -1,0 +1,11 @@
+# 打包产物（放 GitHub Releases，不进仓库）
+*.zip
+
+# 编辑器/系统
+.workbuddy/
+Thumbs.db
+.DS_Store
+
+# 本地快照（设备诊断基线，含本机信息）
+mdns-diag-last.txt
+mdns-diag-history.log

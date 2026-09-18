@@ -1,0 +1,14 @@
+# 行尾策略：shell 脚本与配置文件强制 LF（Android 上 CRLF 会炸）
+*.sh        text eol=lf
+*.prop      text eol=lf
+*.service   text eol=lf
+*.inotify   text eol=lf
+*.md        text
+LICENSE     text
+customize.sh text eol=lf
+
+# 二进制：禁止 git 做文本处理
+tailscale/bin/*  binary
+tailscale/lib/*  binary
+META-INF/com/google/android/update-binary binary
+META-INF/com/google/android/updater-script text eol=lf

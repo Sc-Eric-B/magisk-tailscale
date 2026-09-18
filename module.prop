@@ -1,0 +1,7 @@
+id=magisk-tailscaled
+name=Magisk Tailscaled
+version=v2.0.0.1+ts1.98.8+mdns16.1
+versionCode=02000161
+author=anasfanani
+description=Tailscale. The easiest, most secure way to use WireGuard and 2FA. (Unofficial build: tailscaled v1.98.8 + SmartDNS direct-answer MagicDNS: *.ts.net answered from live tailscale status, no tailscaled DNS server needed)
+updateJson=https://raw.githubusercontent.com/anasfanani/Magisk-Tailscaled/master/update.json
